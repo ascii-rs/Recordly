@@ -5,15 +5,28 @@
 #   nix build .#recordly              # Linux package (see caveats below)
 #   nix run .#recordly                # run the packaged app
 #
+# Electron:
+#   The Electron binary never comes from npm/GitHub in this flake. nixpkgs
+#   builds (and patches) Electron for NixOS, and both the dev shell and the
+#   package point at it:
+#     * dev shell: ELECTRON_OVERRIDE_DIST_PATH -> ${electron}/lib/electron
+#       so `npm run dev` uses the Nix Electron and does NOT need nix-ld.
+#       npm's own ~120 MB binary download is skipped with
+#       ELECTRON_SKIP_BINARY_DOWNLOAD=1.
+#     * package:   electron-builder -c.electronDist -> ${electron}/lib/electron
+#       so the build never downloads the official Electron dist zip.
+#
 # Caveats:
-#   * The package derivation runs `npm ci` + `electron-builder`, both of which
-#     download binaries from the network (Electron dist, whisper.cpp sources,
-#     ffmpeg-static, ...). Nix's default sandbox blocks that, so build with:
+#   * Building still needs network access (npm registry, Electron headers for
+#     the uiohook-napi rebuild, whisper.cpp sources, ffmpeg-static binary), so
+#     Nix's default sandbox blocks it. Build with:
 #         nix build .#recordly --option sandbox false
 #     (or configure `sandbox = false` in nix.conf if you build often).
-#   * The flake pins nixpkgs 24.11. Recordly ships Electron 43; if Electron's
-#     required glibc ever outpaces 24.11's, switch the `nixpkgs` input to
-#     `nixos-unstable` and re-pin `flake.lock`.
+#     Every network step is wrapped in a hard `timeout`, so a flaky network
+#     fails the build loudly instead of hanging it forever.
+#   * The flake pins nixos-unstable so `pkgs.electron_43` exists (Recordly
+#     ships Electron ^43 in package.json). If nixpkgs ever drops electron_43,
+#     the binding falls back to `pkgs.electron` (latest).
 #   * Only Linux can be packaged from Nix (macOS/Windows release builds are
 #     signed upstream). The dev shell still works on macOS for running
 #     `npm install` / `npm run dev` / `npm run build:mac` when Xcode CLT and
@@ -25,7 +38,7 @@
   description = "Recordly: dev shell + Linux package for the Electron screen recorder";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -52,6 +65,11 @@
         # The Linux CI pipeline runs on Node 22 with a Python 3 + CMake +
         # X11-dev toolchain for the native addons (uiohook-napi, whisper.cpp).
         nodejs = pkgs.nodejs_22;
+
+        # Electron comes from nixpkgs (patched for NixOS) instead of the
+        # npm-downloaded zip. Pin the major that package.json requests
+        # (^43.1.0); fall back to the latest if nixpkgs drops electron_43.
+        electron = pkgs.electron_43 or pkgs.electron;
 
         # X11 development headers required by node-gyp/uiohook-napi on Linux
         # (mirrors the apt list in .github/workflows/build.yml).
@@ -106,7 +124,7 @@
 
           nativeBuildInputs =
             [ nodejs pkgs.python3 pkgs.cmake pkgs.pkg-config pkgs.git ]
-            ++ lib.optionals isLinux linuxNativeBuildLibs;
+            ++ lib.optionals isLinux (linuxNativeBuildLibs ++ [ electron ]);
 
           buildInputs = lib.optionals isLinux linuxRuntimeLibs;
 
@@ -115,20 +133,30 @@
             PYTHON = "${pkgs.python3}/bin/python3";
             # Keep native builds on the nix toolchain.
             PKG_CONFIG = "${pkgs.pkg-config}/bin/pkg-config";
+          } // lib.optionalAttrs isLinux {
+            # Run the Electron from nixpkgs instead of the npm-downloaded
+            # binary: it is already patched for NixOS, so `npm run dev` works
+            # without any nix-ld setup.
+            ELECTRON_OVERRIDE_DIST_PATH = "${electron}/lib/electron";
+            # Don't let `npm install` pull the ~120 MB Electron zip from GitHub.
+            ELECTRON_SKIP_BINARY_DOWNLOAD = "1";
           };
 
           shellHook = ''
             echo "🚀 Recordly dev shell (${system})"
-            echo "   Node:  $(node --version 2>/dev/null || echo missing)"
-            echo "   npm:   $(npm --version 2>/dev/null || echo missing)"
-            echo "   CMake: $(cmake --version 2>/dev/null | head -n1 || echo missing)"
+            echo "   Node:    $(node --version 2>/dev/null || echo missing)"
+            echo "   npm:     $(npm --version 2>/dev/null || echo missing)"
+            echo "   CMake:   $(cmake --version 2>/dev/null | head -n1 || echo missing)"
+            echo "   Electron: $ELECTRON_OVERRIDE_DIST_PATH"
             echo ""
             echo "Suggested first run:"
             echo "  npm install"
             echo "  npm run dev"
             echo ""
-            echo "NOTE: 'npm install' downloads Electron/whisper/ffmpeg binaries"
-            echo "      and builds native addons; it needs network access."
+            echo "NOTE: 'npm run dev' uses the Electron from nixpkgs"
+            echo "      (ELECTRON_OVERRIDE_DIST_PATH), so no nix-ld setup is"
+            echo "      needed. npm install still rebuilds uiohook-napi and"
+            echo "      stages whisper.cpp; it needs network access."
           '';
         };
 
@@ -171,17 +199,25 @@
             export npm_config_fetch_retries=0
             export npm_config_fetch_timeout=60000
 
+            # The packaged app uses the Electron from nixpkgs (electronDist
+            # below), so never let npm/electron-builder download its own.
+            export ELECTRON_SKIP_BINARY_DOWNLOAD=1
+
             export jobs="$(nproc)"
             if [ "$jobs" -gt 4 ]; then jobs=4; fi
             export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
             export npm_config_jobs="$jobs"
 
-            # Runs the repo postinstall: rebuilds uiohook-napi for the pinned
-            # Electron and stages the whisper.cpp runtime (downloads sources).
+            # `npm ci` is scripts-free here, mirroring the Linux CI pipeline
+            # (build.yml uses `npm ci --ignore-scripts`). The repo postinstall
+            # used to download the Electron zip and whisper.cpp sources from
+            # GitHub and could stall indefinitely - that was the hang. Binary
+            # downloads and native rebuilds now run explicitly in buildPhase,
+            # each behind a hard `timeout` so nothing can hang forever again.
             # npm hides progress bars without a TTY, so print a heartbeat that
             # shows whether the cache is growing (= downloading) or stalled.
-            echo "npm ci: downloading and installing dependencies (heartbeat every 20s)..."
-            npm ci --no-audit --no-fund &
+            echo "npm ci: downloading registry dependencies (heartbeat every 20s)..."
+            timeout 1200 npm ci --ignore-scripts --no-audit --no-fund &
             npm_pid=$!
             while kill -0 "$npm_pid" 2>/dev/null; do
               sleep 20
@@ -203,20 +239,34 @@
             mkdir -p "$npm_config_cache" "$XDG_CACHE_HOME" "$ELECTRON_BUILDER_CACHE"
             export npm_config_fetch_retries=0
             export npm_config_fetch_timeout=60000
+            export ELECTRON_SKIP_BINARY_DOWNLOAD=1
             export jobs="$(nproc)"
             if [ "$jobs" -gt 4 ]; then jobs=4; fi
             export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
             export npm_config_jobs="$jobs"
 
-            # Mirrors `npm run build:linux`, except the last step targets
-            # `dir` instead of AppImage. The vite build already ran its own
-            # electron-main CJS smoke checks via the closeBundle guard.
-            npm run build:platform-native-helpers
+            # Electron dist provided by nixpkgs (already patched for NixOS).
+            # electron-builder reads it via `electronDist` and never downloads
+            # the official zip. If it complains about a version mismatch with
+            # node_modules/electron, pin `electron` in this flake to the exact
+            # version from package-lock.json.
+            export ELECTRON_DIST="${electron}/lib/electron"
+
+            # Mirrors the Linux CI job in .github/workflows/build.yml:
+            # ffmpeg-static's binary is fetched explicitly (its postinstall
+            # does not run because npm ci was scripts-free)...
+            timeout 600 node node_modules/ffmpeg-static/install.js
+            # ...and uiohook-napi is rebuilt against the pinned Electron.
+            rm -rf node_modules/uiohook-napi/build
+            timeout 1200 ./node_modules/.bin/electron-builder install-app-deps
+
+            # Whisper runtime (downloads whisper.cpp sources, cmake build).
+            timeout 1800 npm run build:platform-native-helpers
             ./node_modules/.bin/tsc
             ./node_modules/.bin/vite build --config vite.config.ts
             npm run normalize:electron-main-cjs
             npm run smoke:electron-main-cjs
-            ./node_modules/.bin/electron-builder --linux dir
+            timeout 1200 ./node_modules/.bin/electron-builder --linux dir --publish never -c.electronDist="$ELECTRON_DIST"
             runHook postBuild
           '';
 
