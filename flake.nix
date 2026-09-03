@@ -155,15 +155,52 @@
             runHook preConfigure
             export HOME="$TMPDIR/home"
             mkdir -p "$HOME"
+
+            # Impure-but-practical build environment:
+            # * keep npm/electron caches in /tmp so failed/retried builds do not
+            #   re-download hundreds of MB (cleared on reboot, recreated here)
+            # * fail fast on unreachable hosts instead of npm retrying silently
+            #   for tens of minutes
+            # * cap C++ jobs so weak machines don't swap-thrash while compiling
+            #   whisper.cpp
+            export npm_config_cache="/tmp/nix-recordly-cache/npm"
+            export XDG_CACHE_HOME="/tmp/nix-recordly-cache/xdg"
+            export ELECTRON_BUILDER_CACHE="/tmp/nix-recordly-cache/electron-builder"
+            mkdir -p "$npm_config_cache" "$XDG_CACHE_HOME" "$ELECTRON_BUILDER_CACHE"
+
+            export npm_config_fetch_retries=0
+            export npm_config_fetch_timeout=60000
+
+            export jobs="$(nproc)"
+            if [ "$jobs" -gt 4 ]; then jobs=4; fi
+            export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
+            export npm_config_jobs="$jobs"
+
             # Runs the repo postinstall: rebuilds uiohook-napi for the pinned
             # Electron and stages the whisper.cpp runtime (downloads sources).
+            # npm hides progress bars without a TTY, so silence = still working.
+            echo "npm ci: downloading and installing dependencies..."
             npm ci --no-audit --no-fund
+            echo "npm ci: done."
             runHook postConfigure
           '';
 
           buildPhase = ''
             runHook preBuild
             export HOME="$TMPDIR/home"
+
+            # Same impure build environment as configurePhase (see above).
+            export npm_config_cache="/tmp/nix-recordly-cache/npm"
+            export XDG_CACHE_HOME="/tmp/nix-recordly-cache/xdg"
+            export ELECTRON_BUILDER_CACHE="/tmp/nix-recordly-cache/electron-builder"
+            mkdir -p "$npm_config_cache" "$XDG_CACHE_HOME" "$ELECTRON_BUILDER_CACHE"
+            export npm_config_fetch_retries=0
+            export npm_config_fetch_timeout=60000
+            export jobs="$(nproc)"
+            if [ "$jobs" -gt 4 ]; then jobs=4; fi
+            export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
+            export npm_config_jobs="$jobs"
+
             # Mirrors `npm run build:linux`, except the last step targets
             # `dir` instead of AppImage. The vite build already ran its own
             # electron-main CJS smoke checks via the closeBundle guard.
