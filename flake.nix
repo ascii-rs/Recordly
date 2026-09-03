@@ -178,9 +178,16 @@
 
             # Runs the repo postinstall: rebuilds uiohook-napi for the pinned
             # Electron and stages the whisper.cpp runtime (downloads sources).
-            # npm hides progress bars without a TTY, so silence = still working.
-            echo "npm ci: downloading and installing dependencies..."
-            npm ci --no-audit --no-fund
+            # npm hides progress bars without a TTY, so print a heartbeat that
+            # shows whether the cache is growing (= downloading) or stalled.
+            echo "npm ci: downloading and installing dependencies (heartbeat every 20s)..."
+            npm ci --no-audit --no-fund &
+            npm_pid=$!
+            while kill -0 "$npm_pid" 2>/dev/null; do
+              sleep 20
+              echo "[nix] npm ci still running; npm cache: $(du -sh "$npm_config_cache" 2>/dev/null | cut -f1)"
+            done
+            wait "$npm_pid"
             echo "npm ci: done."
             runHook postConfigure
           '';
