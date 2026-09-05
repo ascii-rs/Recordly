@@ -16,6 +16,7 @@
 	"type": "module",
 	"scripts": {
 		"dev": "vite --config vite.config.ts",
+		"predev": "node scripts/ensure-electron-runtime.mjs",
 		"postinstall": "node scripts/postinstall.mjs",
 		"build": "npm run build:platform-native-helpers && tsc && vite build --config vite.config.ts && npm run normalize:electron-main-cjs && npm run smoke:electron-main-cjs && electron-builder",
 		"lint": "biome lint .",

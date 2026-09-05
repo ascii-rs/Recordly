@@ -9,12 +9,19 @@
 #   The Electron binary never comes from npm/GitHub in this flake. nixpkgs
 #   builds (and patches) Electron for NixOS, and both the dev shell and the
 #   package point at it:
-#     * dev shell: ELECTRON_OVERRIDE_DIST_PATH -> ${electron}/lib/electron
-#       so `npm run dev` uses the Nix Electron and does NOT need nix-ld.
-#       npm's own ~120 MB binary download is skipped with
-#       ELECTRON_SKIP_BINARY_DOWNLOAD=1.
-#     * package:   electron-builder -c.electronDist -> ${electron}/lib/electron
-#       so the build never downloads the official Electron dist zip.
+#     * dev shell: ELECTRON_OVERRIDE_DIST_PATH -> ${electron}/bin.
+#       npm's `electron` package resolves its dev binary as
+#       "$ELECTRON_OVERRIDE_DIST_PATH/`electron`", and nixpkgs' wrapped
+#       launcher is ${electron}/bin/electron, so `npm run dev` uses the Nix
+#       Electron and does NOT need nix-ld. npm's own ~120 MB binary download
+#       is skipped with ELECTRON_SKIP_BINARY_DOWNLOAD=1. A `predev` guard
+#       (scripts/ensure-electron-runtime.mjs) fails fast with instructions
+#       when the shell was not entered through the flake - that missing
+#       override is what produced the old
+#       "[nix-ld] FATAL ... Posix(2)" panic.
+#     * package:   electron-builder -c.electronDist -> electron.dist
+#       (nixpkgs' ${electron}/libexec/electron), so the build never
+#       downloads the official Electron dist zip.
 #
 # Caveats:
 #   * Building still needs network access (npm registry, Electron headers for
@@ -70,6 +77,12 @@
         # npm-downloaded zip. Pin the major that package.json requests
         # (^43.1.0); fall back to the latest if nixpkgs drops electron_43.
         electron = pkgs.electron_43 or pkgs.electron;
+
+        # Directory containing the Electron dist that electron-builder packs
+        # (-c.electronDist). nixpkgs exposes it as the `dist` passthru
+        # (${electron}/libexec/electron on Linux; there is no lib/electron).
+        electronDist =
+          if isLinux then (electron.dist or "${electron}/libexec/electron") else "";
 
         # X11 development headers required by node-gyp/uiohook-napi on Linux
         # (mirrors the apt list in .github/workflows/build.yml).
@@ -137,9 +150,14 @@
             # Run the Electron from nixpkgs instead of the npm-downloaded
             # binary: it is already patched for NixOS, so `npm run dev` works
             # without any nix-ld setup.
-            ELECTRON_OVERRIDE_DIST_PATH = "${electron}/lib/electron";
+            # npm's `electron` package returns "$OVERRIDE_DIR/`electron`";
+            # nixpkgs' wrapped launcher is ${electron}/bin/electron.
+            ELECTRON_OVERRIDE_DIST_PATH = "${electron}/bin";
             # Don't let `npm install` pull the ~120 MB Electron zip from GitHub.
             ELECTRON_SKIP_BINARY_DOWNLOAD = "1";
+            # Dev parity with the packaged launcher (the FHS wrapper passes
+            # --no-sandbox): Nix cannot ship the SUID chrome-sandbox helper.
+            ELECTRON_DISABLE_SANDBOX = "1";
           };
 
           shellHook = ''
@@ -147,7 +165,7 @@
             echo "   Node:    $(node --version 2>/dev/null || echo missing)"
             echo "   npm:     $(npm --version 2>/dev/null || echo missing)"
             echo "   CMake:   $(cmake --version 2>/dev/null | head -n1 || echo missing)"
-            echo "   Electron: $ELECTRON_OVERRIDE_DIST_PATH"
+            echo "   Electron: $ELECTRON_OVERRIDE_DIST_PATH/electron"
             echo ""
             echo "Suggested first run:"
             echo "  npm install"
@@ -250,7 +268,7 @@
             # the official zip. If it complains about a version mismatch with
             # node_modules/electron, pin `electron` in this flake to the exact
             # version from package-lock.json.
-            export ELECTRON_DIST="${electron}/lib/electron"
+            export ELECTRON_DIST="${electronDist}"
 
             # Mirrors the Linux CI job in .github/workflows/build.yml:
             # ffmpeg-static's binary is fetched explicitly (its postinstall
