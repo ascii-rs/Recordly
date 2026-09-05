@@ -208,6 +208,7 @@ Notes:
 
 - Electron comes from nixpkgs (patched for NixOS), so `npm run dev` in the dev shell works without nix-ld. `npm install` outside the dev shell on NixOS will fail with the `[nix-ld] FATAL ... Posix(2)` panic — use `nix develop` first.
 - `nix build` uses the `dir` target (a plain directory in `release/linux-unpacked`) instead of AppImage, so no FUSE is needed.
+- Auto-updates are disabled for Nix installs (the Nix store is immutable). Recordly checks for this and points you to `nix run` / your flake input instead.
 
 ---
 

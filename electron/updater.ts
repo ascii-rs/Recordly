@@ -156,12 +156,27 @@ export function setExperimentalUpdatesEnabled(enabled: boolean) {
 	return enabled;
 }
 
+function getRealExecPath(execPath: string): string {
+	try {
+		return fs.realpathSync(execPath);
+	} catch {
+		return execPath;
+	}
+}
+
+export function isNixStoreInstall(execPath: string = process.execPath): boolean {
+	const realPath = getRealExecPath(execPath);
+	// Nix store paths look like /nix/store/<hash>-<name>/...; the hash is always
+	// 32 lower-case base32 characters. Checking the prefix alone is enough.
+	return realPath === "/nix/store" || realPath.startsWith("/nix/store/");
+}
+
 function canUseAutoUpdates() {
-	return !AUTO_UPDATES_DISABLED && app.isPackaged && !process.mas;
+	return !AUTO_UPDATES_DISABLED && app.isPackaged && !process.mas && !isNixStoreInstall();
 }
 
 export function isAutoUpdateFeatureEnabled() {
-	return !AUTO_UPDATES_DISABLED;
+	return !AUTO_UPDATES_DISABLED && !isNixStoreInstall();
 }
 
 function getDialogWindow(getMainWindow: () => BrowserWindow | null) {
@@ -698,7 +713,7 @@ export async function checkForAppUpdates(
 ) {
 	if (!canUseAutoUpdates()) {
 		writeUpdaterLog(
-			`Skipped update check because auto-updates are unavailable. packaged=${app.isPackaged} mas=${process.mas ? "yes" : "no"} disabled=${AUTO_UPDATES_DISABLED ? "yes" : "no"}`,
+			`Skipped update check because auto-updates are unavailable. packaged=${app.isPackaged} mas=${process.mas ? "yes" : "no"} disabled=${AUTO_UPDATES_DISABLED ? "yes" : "no"} nixStore=${isNixStoreInstall() ? "yes" : "no"}`,
 		);
 		if (options?.manual) {
 			await showMessageBox(getMainWindow, {
@@ -707,7 +722,9 @@ export async function checkForAppUpdates(
 				message: "Auto-updates are only available in packaged releases.",
 				detail: AUTO_UPDATES_DISABLED
 					? "This build disabled auto-updates through RECORDLY_DISABLE_AUTO_UPDATES=1."
-					: "Development builds do not ship the packaged update metadata required by electron-updater.",
+					: isNixStoreInstall()
+						? "Auto-updates are not supported for Nix installs because the Nix store is immutable. Update Recordly through nix (for example `nix run github:webadderallorg/Recordly` or your flake input)."
+						: "Development builds do not ship the packaged update metadata required by electron-updater.",
 			});
 		}
 		return;

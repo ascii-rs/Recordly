@@ -153,19 +153,31 @@
           at-spi2-core
           libpulseaudio
           xdg-utils
+          # uiohook-napi dlopens these through its prebuild at runtime (global
+          # hotkeys / cursor tracking). libXtst + libXt must therefore be in the
+          # FHS runtime library set, not only in the build inputs.
           xorg.libX11
+          xorg.libXt
+          xorg.libXtst
+          xorg.libXrandr
           xorg.libXcomposite
           xorg.libXcursor
           xorg.libXdamage
           xorg.libXext
           xorg.libXfixes
           xorg.libXi
-          xorg.libXrandr
           xorg.libXrender
           xorg.libXScrnSaver
           xorg.libXinerama
           xorg.libxcb
         ];
+
+        # Electron-updater cannot install into the immutable Nix store, so the
+        # FHS wrapper exports this and the main process skips the updater
+        # entirely ("Auto-updates are not supported for this install type.").
+        recordlyNixEnvVars = {
+          RECORDLY_DISABLE_AUTO_UPDATES = "1";
+        };
 
         # --------------------------------------------------------------------
         # Dev shell
@@ -399,6 +411,13 @@
               pkgs.vulkan-loader
             ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export LIBGL_DRIVERS_PATH="${pkgs.mesa.drivers}/lib/dri"
+
+            # Auto-updates cannot install into the immutable Nix store.
+            ${lib.concatStringsSep "\n            " (
+              lib.mapAttrsToList (
+                name: value: "export ${name}=${lib.strings.escapeShellArg value}"
+              ) recordlyNixEnvVars
+            )}
 
             exec recordly --no-sandbox "$@"
           '';
