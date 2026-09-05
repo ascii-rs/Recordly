@@ -40,6 +40,30 @@
 #     the signing credentials are available.
 #   * The app is launched with --no-sandbox because Nix can't ship the SUID
 #     chrome-sandbox helper; the app only loads local content.
+#
+# Runtime GPU + GIO notes (why the wrapper looks the way it does):
+#   * Electron's ANGLE frontend dlopens libEGL.so.1 at startup. That dispatch
+#     library lives in pkgs.libGL (libglvnd), NOT in pkgs.mesa - and the
+#     actual DRI/llvmpipe drivers live in mesa.drivers. Without them the log
+#     fills with:
+#       "Could not dlopen native EGL: libEGL.so.1: cannot open shared object
+#        file: No such file or directory"
+#       "Initialization of all (2) EGL display types failed."
+#       "Exiting GPU process due to errors during initialization"
+#     libGL + mesa.drivers + vulkan-loader are therefore part of the runtime
+#     library set and are also put on LD_LIBRARY_PATH by the FHS run script
+#     (with LIBGL_DRIVERS_PATH pointing at the DRI drivers).
+#   * Host sessions may export GIO_MODULE_DIR (or GIO_EXTRA_MODULES) pointing
+#     at a gvfs built against a different glib; those modules then die with
+#       "libgvfscommon.so: undefined symbol: g_variant_builder_init_static"
+#       "Failed to load module: .../libgvfsdbus.so"
+#     The run script unsets both so GIO uses the FHS glib's own module dir.
+#     File dialogs keep working through GTK.
+#   * The log line about "org.freedesktop.portal.FileChooser ... InvalidArgs"
+#     is a harmless capability probe: it only fails when the host session runs
+#     an xdg-desktop-portal backend without the FileChooser interface (e.g. a
+#     Wayland compositor session without xdg-desktop-portal-gtk installed).
+#     Electron then falls back to the native GTK dialog.
 
 {
   description = "Recordly: dev shell + Linux package for the Electron screen recorder";
@@ -100,7 +124,20 @@
         # started from the dev shell (`npm run dev`) these are also needed, so
         # they double as the dev shell's buildInputs (mkShell exposes their lib
         # dirs via LD_LIBRARY_PATH automatically).
+        #
+        # GL stack notes:
+        #   * libGL (libglvnd) provides the libEGL.so.1 / libGL.so.1 dispatch
+        #     libraries that Electron's ANGLE frontend dlopens by name at
+        #     runtime; mesa alone does NOT provide them.
+        #   * mesa.drivers provides the actual DRI drivers (including llvmpipe
+        #     software rendering) selected via LIBGL_DRIVERS_PATH.
+        #   * vulkan-loader + gst are not strictly required but let
+        #     hardware-accelerated decode paths initialize instead of failing.
         linuxRuntimeLibs = with pkgs; [
+          libGL
+          (pkgs.lib.getLib mesa)
+          mesa.drivers
+          vulkan-loader
           gtk3
           gsettings-desktop-schemas
           adwaita-icon-theme
@@ -110,11 +147,12 @@
           cups
           dbus
           libdrm
-          mesa
           libxkbcommon
           libsecret
           libnotify
           at-spi2-core
+          libpulseaudio
+          xdg-utils
           xorg.libX11
           xorg.libXcomposite
           xorg.libXcursor
@@ -158,6 +196,18 @@
             # Dev parity with the packaged launcher (the FHS wrapper passes
             # --no-sandbox): Nix cannot ship the SUID chrome-sandbox helper.
             ELECTRON_DISABLE_SANDBOX = "1";
+            # GL: ANGLE dlopens libEGL.so.1 (libglvnd, in libGL) and needs the
+            # DRI drivers from mesa.drivers at runtime. Without these the log
+            # floods with "Could not dlopen native EGL: libEGL.so.1" and the
+            # GPU process exits at startup.
+            LD_LIBRARY_PATH = lib.makeLibraryPath [
+              electron
+              (pkgs.lib.getLib pkgs.mesa)
+              pkgs.mesa.drivers
+              pkgs.libGL
+              pkgs.vulkan-loader
+            ];
+            LIBGL_DRIVERS_PATH = "${pkgs.mesa.drivers}/lib/dri";
           };
 
           shellHook = ''
@@ -317,13 +367,41 @@
         };
 
         # FHS wrapper: gives the bundled Electron binary a complete runtime
-        # environment (GTK, NSS, ALSA, X11, ...) without chasing transitive
-        # library paths by hand.
+        # environment (GTK, NSS, ALSA, PulseAudio, X11, GL, xdg-utils for
+        # shell.openExternal, ...) without chasing transitive library paths
+        # by hand.
         recordly = pkgs.buildFHSEnv {
           name = "recordly";
           targetPkgs = pkgs': [ recordlyUnwrapped ] ++ linuxRuntimeLibs;
-          runScript = "recordly --no-sandbox";
-        } // {
+          runScript = ''
+            # Host sessions can leak environment that breaks the packaged app:
+            #
+            # * GIO_MODULE_DIR / GIO_EXTRA_MODULES may point at the host's gvfs
+            #   modules, built against a different glib. Loading them fails
+            #   with "undefined symbol: g_variant_builder_init_static" and
+            #   "Failed to load module: .../libgvfsdbus.so". Unset them so GIO
+            #   uses the module dir of the glib inside this FHS environment.
+            #   File dialogs keep working through GTK.
+            #
+            # (The "org.freedesktop.portal.FileChooser ... InvalidArgs" message
+            # that can still appear is a harmless probe: the session portal has
+            # no FileChooser interface and Electron falls back to the native
+            # GTK dialog.)
+            unset GIO_MODULE_DIR GIO_EXTRA_MODULES GTK_USE_PORTAL
+
+            # Make the GL stack resolvable by name: ANGLE dlopens libEGL.so.1
+            # (libglvnd, in libGL) and EGL needs the DRI drivers from
+            # mesa.drivers via LIBGL_DRIVERS_PATH.
+            export LD_LIBRARY_PATH="${lib.makeLibraryPath [
+              pkgs.libGL
+              (pkgs.lib.getLib pkgs.mesa)
+              pkgs.mesa.drivers
+              pkgs.vulkan-loader
+            ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export LIBGL_DRIVERS_PATH="${pkgs.mesa.drivers}/lib/dri"
+
+            exec recordly --no-sandbox "$@"
+          '';
           meta = {
             description = "Recordly – free, creator-focused screen recorder with auto-zoom, cursor effects, backgrounds, annotations, and editing";
             homepage = "https://github.com/webadderallorg/Recordly";

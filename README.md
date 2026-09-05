@@ -188,6 +188,29 @@ PKGBUILD, desktop entry, release sync, and optional **local-from-source** packag
 
 ---
 
+## NixOS / Nix
+
+Run the app directly (downloads dependencies and builds once, then runs from the Nix store):
+
+```bash
+nix run github:webadderallorg/Recordly
+```
+
+Or from a checkout:
+
+```bash
+nix run .#recordly          # run the packaged app
+nix develop                 # Node 22 + Electron + X11/GL toolchain for `npm install && npm run dev`
+nix build .#recordly -L     # build the Linux package (needs `--option sandbox false` for npm/whisper downloads)
+```
+
+Notes:
+
+- Electron comes from nixpkgs (patched for NixOS), so `npm run dev` in the dev shell works without nix-ld. `npm install` outside the dev shell on NixOS will fail with the `[nix-ld] FATAL ... Posix(2)` panic — use `nix develop` first.
+- `nix build` uses the `dir` target (a plain directory in `release/linux-unpacked`) instead of AppImage, so no FUSE is needed.
+
+---
+
 ## Build from source
 
 ### Prerequisites
