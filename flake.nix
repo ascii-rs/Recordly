@@ -2,8 +2,9 @@
 #
 # Usage:
 #   nix develop                       # Node 22 + native toolchain + X11 dev libs
-#   nix build .#recordly              # Linux package (see caveats below)
+#   nix build .#recordly              # Linux package from source (see caveats below)
 #   nix run .#recordly                # run the packaged app
+#   nix build .#recordlyRelease       # download the upstream release AppImage and run it
 #
 # Electron:
 #   The Electron binary never comes from npm/GitHub in this flake. nixpkgs
@@ -31,6 +32,9 @@
 #     (or configure `sandbox = false` in nix.conf if you build often).
 #     Every network step is wrapped in a hard `timeout`, so a flaky network
 #     fails the build loudly instead of hanging it forever.
+#   * `nix run .#recordly` uses the source-built Linux package so the
+#     renderer assets are present. The published AppImage release asset
+#     currently omits `dist/` and will not show the UI on its own.
 #   * The flake pins nixos-unstable so `pkgs.electron_43` exists (Recordly
 #     ships Electron ^43 in package.json). If nixpkgs ever drops electron_43,
 #     the binding falls back to `pkgs.electron` (latest).
@@ -64,6 +68,12 @@
 #     an xdg-desktop-portal backend without the FileChooser interface (e.g. a
 #     Wayland compositor session without xdg-desktop-portal-gtk installed).
 #     Electron then falls back to the native GTK dialog.
+#   * When the Nix daemon builds with `sandbox = false`, Node still uses
+#     nixpkgs' CA bundle rather than the host trust store. On hosts with a
+#     locally trusted proxy/root CA this makes npm fail with
+#     `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`. The build phases prefer the host
+#     bundle when it is available; otherwise Node/npm's normal trust store is
+#     untouched. This is deliberately not a TLS-verification bypass.
 
 {
   description = "Recordly: dev shell + Linux package for the Electron screen recorder";
@@ -131,7 +141,7 @@
         #     runtime; mesa alone does NOT provide them.
         #   * mesa.drivers provides the actual DRI drivers (including llvmpipe
         #     software rendering) selected via LIBGL_DRIVERS_PATH.
-        #   * vulkan-loader + gst are not strictly required but let
+        #   * vulkan-loader is not strictly required but lets
         #     hardware-accelerated decode paths initialize instead of failing.
         linuxRuntimeLibs = with pkgs; [
           libGL
@@ -159,13 +169,13 @@
           xorg.libX11
           xorg.libXt
           xorg.libXtst
-          xorg.libXrandr
           xorg.libXcomposite
           xorg.libXcursor
           xorg.libXdamage
           xorg.libXext
           xorg.libXfixes
           xorg.libXi
+          xorg.libXrandr
           xorg.libXrender
           xorg.libXScrnSaver
           xorg.libXinerama
@@ -178,6 +188,25 @@
         recordlyNixEnvVars = {
           RECORDLY_DISABLE_AUTO_UPDATES = "1";
         };
+
+        # When the Nix daemon builds with `sandbox = false`, Node still uses
+        # nixpkgs' CA bundle rather than the host trust store.  On hosts with
+        # a locally trusted proxy/root CA this makes npm fail with
+        # `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`.  Prefer the host bundle when
+        # it is available; otherwise leave Node/npm's normal trust store
+        # untouched.  This is deliberately not a TLS-verification bypass.
+        configureNodeCertificateTrust = ''
+          for recordly_ca_bundle in \
+            /etc/ssl/certs/ca-bundle.crt \
+            /etc/ssl/certs/ca-certificates.crt; do
+            if [ -r "$recordly_ca_bundle" ]; then
+              export NODE_EXTRA_CA_CERTS="$recordly_ca_bundle"
+              export npm_config_cafile="$recordly_ca_bundle"
+              echo "Using host CA bundle for Node/npm: $recordly_ca_bundle"
+              break
+            fi
+          done
+        '';
 
         # --------------------------------------------------------------------
         # Dev shell
@@ -223,6 +252,7 @@
           };
 
           shellHook = ''
+            ${lib.optionalString isLinux configureNodeCertificateTrust}
             echo "🚀 Recordly dev shell (${system})"
             echo "   Node:    $(node --version 2>/dev/null || echo missing)"
             echo "   npm:     $(npm --version 2>/dev/null || echo missing)"
@@ -241,9 +271,10 @@
         };
 
         # --------------------------------------------------------------------
-        # Package: builds the app like `npm run build:linux` but with the
-        # `dir` electron-builder target (release/linux-unpacked), which avoids
-        # the AppImage toolchain/fuse and is directly wrappable for Nix.
+        # Package from source: builds the app like `npm run build:linux` but
+        # with the `dir` electron-builder target (release/linux-unpacked),
+        # which avoids the AppImage toolchain/fuse and is directly wrappable
+        # for Nix.
         # --------------------------------------------------------------------
         recordlyUnwrapped = pkgs.stdenv.mkDerivation {
           pname = "recordly-unwrapped";
@@ -252,9 +283,9 @@
 
           nativeBuildInputs =
             [ nodejs pkgs.python3 pkgs.cmake pkgs.pkg-config pkgs.git ]
-            ++ linuxNativeBuildLibs;
+            ++ lib.optionals isLinux linuxNativeBuildLibs;
 
-          buildInputs = linuxRuntimeLibs;
+          buildInputs = lib.optionals isLinux linuxRuntimeLibs;
 
           dontStrip = true; # electron-builder ships pre-stripped binaries
           enableParallelBuilding = true;
@@ -263,12 +294,13 @@
             runHook preConfigure
             export HOME="$TMPDIR/home"
             mkdir -p "$HOME"
+            ${configureNodeCertificateTrust}
 
             # Impure-but-practical build environment:
             # * keep npm/electron caches in /tmp so failed/retried builds do not
             #   re-download hundreds of MB (cleared on reboot, recreated here)
-            # * fail fast on unreachable hosts instead of npm retrying silently
-            #   for tens of minutes
+            # * fail fast on unreachable hosts when sandbox=false, instead of
+            #   npm retrying silently for tens of minutes
             # * cap C++ jobs so weak machines don't swap-thrash while compiling
             #   whisper.cpp
             export npm_config_cache="/tmp/nix-recordly-cache/npm"
@@ -311,6 +343,7 @@
           buildPhase = ''
             runHook preBuild
             export HOME="$TMPDIR/home"
+            ${configureNodeCertificateTrust}
 
             # Same impure build environment as configurePhase (see above).
             export npm_config_cache="/tmp/nix-recordly-cache/npm"
@@ -382,7 +415,7 @@
         # environment (GTK, NSS, ALSA, PulseAudio, X11, GL, xdg-utils for
         # shell.openExternal, ...) without chasing transitive library paths
         # by hand.
-        recordly = pkgs.buildFHSEnv {
+        recordlySource = pkgs.buildFHSEnv {
           name = "recordly";
           targetPkgs = pkgs': [ recordlyUnwrapped ] ++ linuxRuntimeLibs;
           runScript = ''
@@ -421,22 +454,71 @@
 
             exec recordly --no-sandbox "$@"
           '';
-          meta = {
-            description = "Recordly – free, creator-focused screen recorder with auto-zoom, cursor effects, backgrounds, annotations, and editing";
-            homepage = "https://github.com/webadderallorg/Recordly";
-            license = lib.licenses.agpl3Only;
-            platforms = lib.platforms.linux;
-            mainProgram = "recordly";
-          };
         };
+
+        # --------------------------------------------------------------------
+        # Release AppImage: downloads the upstream release asset and runs it
+        # via appimage-run. Convenience only - the published AppImage omits
+        # the renderer `dist/` bundle, so prefer .#recordly for a working UI.
+        # NOTE: the fetchurl hash is pinned to the asset of the current
+        # `version`; bump it together with package.json version bumps.
+        # --------------------------------------------------------------------
+        recordlyRelease =
+          if system == "x86_64-linux" then
+            pkgs.writeShellApplication
+              {
+                name = "recordly";
+                runtimeInputs = [ pkgs.appimage-run ];
+                text = ''
+                  export RECORDLY_DISABLE_AUTO_UPDATES=1
+                  export RECORDLY_FORCE_SOFTWARE_RENDERING=1
+                  exec appimage-run ${pkgs.fetchurl {
+                    url = "https://github.com/webadderallorg/Recordly/releases/download/v${version}/Recordly-linux-x64.AppImage";
+                    hash = "sha256-wW3pTkaAiNv6r7aAAd5r0eWob6vQUobQV3kK77xbGuM=";
+                  }} --no-sandbox "$@"
+                '';
+              }
+          else
+            recordlySource;
+
+        recordly = recordlySource;
+        recordlyApp = recordlySource;
       in
       {
         devShells.default = devShell;
 
+        apps = lib.optionalAttrs isLinux {
+          default = {
+            type = "app";
+            program = "${recordlyApp}/bin/recordly";
+            meta = {
+              description = "Recordly app launcher";
+            };
+          };
+
+          recordly = {
+            type = "app";
+            program = "${recordlyApp}/bin/recordly";
+            meta = {
+              description = "Recordly app launcher";
+            };
+          };
+        };
+
+        checks = {
+          flake-format = pkgs.runCommand "recordly-flake-format"
+            {
+              nativeBuildInputs = [ pkgs.nixpkgs-fmt ];
+            } ''
+            nixpkgs-fmt --check ${./flake.nix}
+            touch $out
+          '';
+        };
+
         # Packaging only makes sense on Linux from Nix; macOS/Windows release
         # artifacts are produced by the upstream CI (macOS needs signing).
         packages = lib.optionalAttrs isLinux {
-          inherit recordly recordlyUnwrapped;
+          inherit recordly recordlyRelease recordlySource recordlyUnwrapped;
           default = recordly;
         };
 
